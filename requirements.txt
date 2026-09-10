@@ -1,6 +1,7 @@
-langchain
+langchain[mcp]>=1.4.0
 langchain-ollama
-langchain-mcp-adapters
 langgraph
 pydantic
 fastmcp
+py-key-value-aio[disk]
+cryptography

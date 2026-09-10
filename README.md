@@ -114,7 +114,7 @@ Email Notification: No
 
 # Requirements
 
-* Python 3.9+
+* Python 3.10+
 * Ollama
 * Jira Cloud account
 * Slack workspace
@@ -126,7 +126,9 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Installs: `langchain`, `langchain-ollama`, `langchain-mcp-adapters`, `langgraph`, `pydantic`, `fastmcp`.
+Installs: `langchain[mcp]` (>=1.4.0), `langchain-ollama`, `langgraph`, `pydantic`, `fastmcp`.
+
+MCP support here uses the built-in `langchain.mcp` namespace (which wraps FastMCP), not the older standalone `langchain-mcp-adapters` package — that package doesn't perform OAuth for remote servers and will get a 401 against Atlassian/Slack's hosted MCP endpoints. `langchain.mcp.MCPAdapter` with `auth="oauth"` handles the full OAuth 2.1 flow (discovery, dynamic client registration, browser consent) automatically.
 
 No Node.js or `npx` is required — both Jira and Slack are accessed through their official hosted MCP servers.
 
@@ -152,9 +154,9 @@ Start the Ollama service.
 
 # Jira Configuration
 
-The agent talks to **Atlassian's official Rovo MCP server** (`https://mcp.atlassian.com/v1/sse`), which authenticates via **OAuth 2.1** (or an API token, if an org admin has enabled that method) and scopes access to whatever Jira projects your account can already see.
+The agent talks to **Atlassian's official Rovo MCP server** (`https://mcp.atlassian.com/v1/sse`), authenticated via `langchain.mcp.MCPAdapter`'s `auth="oauth"` (FastMCP's OAuth 2.1 client: discovery, dynamic client registration, and a browser consent step, automatically).
 
-* No API token is stored in the script.
+* No API token or bearer token is stored in the script.
 * The agent calls `getAccessibleAtlassianResources` at the start of each run to resolve your Atlassian **cloudId**, then passes that into `createJiraIssue`.
 * Set the project key as an environment variable:
 
@@ -163,30 +165,67 @@ export JIRA_PROJECT_KEY="SCRUM"
 export JIRA_SITE_URL="https://your-domain.atlassian.net"
 ```
 
-* First run will trigger an OAuth consent flow — this needs to be completed interactively at least once.
-* **Still to confirm:** the exact required/optional fields `createJiraIssue` expects (in particular, whether `description` needs to be pre-formatted as Atlassian Document Format rather than plain text) — check `tool.args_schema` after calling `client.get_tools()`.
+* First run opens a browser for OAuth consent. Tokens are cached in an encrypted local store (`~/.helpdesk-agent/oauth-tokens`), so subsequent runs reuse them instead of reopening the browser — see "Persisting OAuth Tokens" below.
+* **Still to confirm:** the exact required/optional fields `createJiraIssue` expects (in particular, whether `description` needs to be pre-formatted as Atlassian Document Format rather than plain text) — check `tool.args_schema` after calling `adapter.list_tools()`.
+* **Known past failure mode:** an earlier version of this project pointed a config dict directly at the SSE URL with no `auth` at all, which sends an unauthenticated request and gets a `401 Unauthorized` from Atlassian. If you see that error, confirm you're on the `langchain.mcp.MCPAdapter` + `auth="oauth"` path described above, not a bare URL config.
 
 ---
 
 # Slack Configuration
 
-Slack ships its own first-party remote MCP server, hosted at `https://mcp.slack.com/mcp`, generally available since February 17, 2026. Like the Atlassian server, it's remote and OAuth-based: JSON-RPC 2.0 over Streamable HTTP, authenticating individual users through OAuth 2.0 with granular scopes rather than a shared bot token, and it inherits the authenticating user's own Slack permissions rather than a separate service account.
-
-* No bot token, no `npx` package, nothing local to install for Slack.
-* A workspace admin must approve the connection before it can be used the first time.
-* Set the target channel:
+Slack ships its own first-party remote MCP server, hosted at `https://mcp.slack.com/mcp`, generally available since February 17, 2026. It's remote and OAuth 2.1-based — but unlike Atlassian's server, **it does not support Dynamic Client Registration (DCR)**. Auto-registration (`auth="oauth"`) fails against it with something like:
 
 ```
+RuntimeError: Client failed to connect: Registration failed: 302
+(redirected to https://mcp-<id>.slack.com/register; not followed)
+```
+
+This is a known limitation of Slack's MCP server, not specific to this project — the same failure has been reported against other MCP clients (Cursor, Claude Code) connecting to `mcp.slack.com`. The fix is a **pre-registered OAuth app** instead of DCR:
+
+1. Create an app at https://api.slack.com/apps → "From scratch"
+2. Open **Agents & AI Apps** in the sidebar and toggle on **Model Context Protocol**
+3. Open **OAuth & Permissions** → under Redirect URLs, add exactly:
+
+```
+http://127.0.0.1:8732/callback
+```
+
+   (`8732` matches `SLACK_OAUTH_CALLBACK_PORT` in the script — change both together if you need a different port)
+
+4. Add the User Token Scopes your MCP use case needs
+5. Install/approve the app for your workspace, then copy the **Client ID** (and **Client Secret**, if using a confidential app) from Basic Information
+6. Set:
+
+```
+export SLACK_MCP_CLIENT_ID="your-client-id"
+export SLACK_MCP_CLIENT_SECRET="your-client-secret"   # omit for a public/PKCE-only app
 export SLACK_CHANNEL_ID="C0XXXXXXX"
 ```
 
-* First run triggers an OAuth consent flow, same as Atlassian — needs to be completed interactively at least once.
+* First run still opens a browser for consent, but authenticates against your pre-registered app instead of attempting DCR. Tokens are cached the same way as Jira's — see "Persisting OAuth Tokens" below.
 
 (There is also a locally-run alternative — `@modelcontextprotocol/server-slack` — but it's Anthropic's archived reference server: an early local server configured with Slack bot tokens, no longer patched. A maintained community alternative, korotovsky/slack-mcp-server, self-hosted via npx or Docker, exists if a local deployment is ever preferred over the hosted one. This project uses the official hosted server.)
 
 ---
 
-# Email MCP Server Configuration
+# Persisting OAuth Tokens
+
+By default, FastMCP's `OAuth` helper holds tokens in memory only — since each run of the script is a fresh Python process, that meant every single run re-triggered the browser consent flow for both Jira and Slack. This project instead uses an encrypted, on-disk token store shared by both, so consent only needs to happen once.
+
+* Requires `py-key-value-aio[disk]` and `cryptography` (already in `requirements.txt`). Disk-backed storage is an opt-in extra in FastMCP 3+, after a CVE in the underlying `diskcache` package.
+* Tokens are written to `~/.helpdesk-agent/oauth-tokens/`, encrypted with a key kept at `~/.helpdesk-agent/oauth-key`.
+* The encryption key is generated automatically on first run if `OAUTH_STORAGE_ENCRYPTION_KEY` isn't set. To pin it explicitly instead (e.g. to back it up, or share it across machines):
+
+```
+export OAUTH_STORAGE_ENCRYPTION_KEY="$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+```
+
+* Losing the key file just means re-authenticating on the next run — it only protects the local token cache, not your Jira/Slack accounts themselves.
+* Delete `~/.helpdesk-agent/` entirely to force fresh consent for both services (e.g. after changing scopes).
+
+---
+
+
 
 SMTP settings are supplied as environment variables and consumed by `email_mcp_server.py`:
 
@@ -228,7 +267,7 @@ Stop it:
 kill <pid>
 ```
 
-**Still missing:** whether the OAuth session/token for the Atlassian and Slack remote servers is cached to disk between runs (so re-authentication isn't required every single execution) hasn't been verified against `langchain-mcp-adapters`' behavior.
+**Resolved:** OAuth tokens for Atlassian and Slack are now cached to an encrypted local store rather than held in memory — see "Persisting OAuth Tokens" above. Both connections should only need browser consent once, not on every run.
 
 ---
 
